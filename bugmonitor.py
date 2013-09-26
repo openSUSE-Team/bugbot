@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import re
 import sqlite3
 
@@ -27,15 +28,24 @@ IRC_HOST    = 'irc.freenode.org'
 IRC_NICK    = 'Furcifer'
 IRC_CHANNEL = '#opensuse-pizza-hackaton'
 
+START = datetime(2013, 9, 27)
+STOP  = datetime(2013, 9, 28)
 
 DBNAME = 'bugmonitor.db'
 
-# Evaluation constants
-NONE   = 0
-GOLD   = 1
-SILVER = 2
-BRONZE = 3
+# Points table
+TABLE = {
+    'FIX GOLD':  100,
+    'FIX SILVER': 80,
+    'FIX BRONZE': 60,
+    'FIX OTHER':  50,
+    'SCR GOLD':   25,
+    'SCR SILVER': 20,
+    'SCR BRONZE': 15,
+    'SCR OTHER':  10,
+}
 
+HTML = '/tmp/table.html'
 
 def initdb(dbname):
     """Initialize the database, removing old data."""
@@ -254,14 +264,14 @@ def evaluate(dbname, bug):
 
     c.execute('SELECT * FROM ranking WHERE name=?', (bug['who'],))
     row = c.fetchone()
-    (gold_fix, silver_fix, bronze_fix, other_fix,
+    (_, gold_fix, silver_fix, bronze_fix, other_fix,
      gold_scr, silver_scr, bronze_scr, other_scr,
-     suspicious, other) = row if row else [0]*10
+     suspicious, other) = row if row else [0]*11
 
     bugid = re.findall(r'\[Bug (\d+)\].*', bug['name'])[0]
     evaluation = get_bug_evaluation(bugid)
 
-    status = [evaluation]
+    status = [evaluation if evaluation else 'Other']
 
     if is_fix(bug):
         status.append('FIX')
@@ -290,20 +300,9 @@ def evaluate(dbname, bug):
         status.append('OTHER')
         other += 1
 
-    print (bug['who'],
-                   gold_fix,
-                   silver_fix,
-                   bronze_fix,
-                   other_fix,
-                   gold_scr,
-                   silver_scr,
-                   bronze_scr,
-                   other_scr,
-                   suspicious,
-                   other)
-    print (bug['who'],
-               bugid,
-               ','.join(status))
+    print (bug['who'], gold_fix, silver_fix, bronze_fix, other_fix,
+           gold_scr, silver_scr, bronze_scr, other_scr, suspicious, other)
+    print (bug['who'], bugid, ','.join(status))
 
     if row:
         c.execute("""UPDATE ranking
@@ -354,7 +353,7 @@ def evaluate(dbname, bug):
     conn.close()
 
 
-def process(msgids):
+def process(dbname, msgids):
     messages = srv.fetch(msgids, ('FLAGS', 'INTERNALDATE', 'ENVELOPE',
                                   'BODY[HEADER]', 'BODY[TEXT]'))
     print 'Processing %d unread messages...' % len(messages)
@@ -366,7 +365,73 @@ def process(msgids):
             continue
 
         store(dbname, bug)
+        # if START <= bug['date'] < STOP:
+        #     evaluate(dbname, bug)
         evaluate(dbname, bug)
+
+
+def ranking(dbname, html=False):
+    conn = sqlite3.connect(dbname)
+    c = conn.cursor()
+    c.execute('SELECT * FROM ranking')
+
+    table = []
+    for row in c:
+        table.append(list(row))
+        l = table[-1]
+        points = (l[1] * TABLE['FIX GOLD'] +
+                  l[2] * TABLE['FIX SILVER'] +
+                  l[3] * TABLE['FIX BRONZE'] +
+                  l[4] * TABLE['FIX OTHER'] +
+                  l[5] * TABLE['SCR GOLD'] +
+                  l[6] * TABLE['SCR SILVER'] +
+                  l[7] * TABLE['SCR BRONZE'] +
+                  l[8] * TABLE['SCR OTHER'])
+        l.append(points)
+
+    conn.close()
+    table.sort(key=lambda x: x[-1], reverse=True)
+
+    if not html:
+        return table
+
+    table_html = """<!DOCTYPE HTML>
+<html lang = "en">
+  <head>
+    <title>Beta Pizza Hackathon Ranking</title>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Cache-control" content="no-cache">
+    <meta http-equiv="refresh" content="300" />
+    <style type = "text/css">
+    table, td, th {
+      border: 1px solid black;
+    } 
+    </style>
+  </head>
+  <body>
+    <h1>Ranking</h1>
+    <table>
+      <tr>
+        <th>User</th>
+        <th>Fix Gold</th>
+        <th>Fix Silver</th>
+        <th>Fix Bronze</th>
+        <th>Fix Other</th>
+        <th>Scr Gold</th>
+        <th>Scr Silver</th>
+        <th>Scr Bronze</th>
+        <th>Scr Other</th>
+        <th>Suspicious</th>
+        <th>Other</th>
+        <th>Total</th>
+      </tr>"""
+    for line in table:
+        table_html += '\n<tr>' + ''.join('<td>%s</td>'%v for v in line) + '</tr>'
+    table_html += """
+    </table>
+  </body>
+</html>"""
+    return table_html
 
 
 if __name__ == '__main__':
@@ -404,13 +469,17 @@ if __name__ == '__main__':
         'UNSEEN',
         'FROM bugzilla_noreply@novell.com',
     )
-    process((329,)) # srv.search(criteria))
+    process(dbname, srv.search(criteria))
+    with open(HTML, 'w') as f:
+        print >>f, ranking(dbname, html=True)
 
     print 'Processing new messages to arrive...'
     while True:
         srv.idle()
         response = srv.idle_check()
         srv.idle_done()
-        process([r[0] for r in response if r[1] == 'EXISTS'])
+        process(dbname, [r[0] for r in response if r[1] == 'EXISTS'])
+        with open(HTML, 'w') as f:
+            print >>f, ranking(dbname, html=True)
 
     srv.idle_done()
