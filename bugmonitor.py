@@ -1,9 +1,13 @@
 import argparse
 from datetime import datetime
 import re
+import threading
 import sqlite3
 
 from imapclient import IMAPClient
+
+import irc.bot
+import irc.strings
 
 try:
     import suse.bugzilla
@@ -25,6 +29,7 @@ BZ_PASSWORD = ''
 
 # IRC Parameters
 IRC_HOST    = 'irc.freenode.org'
+IRC_PORT    = 6667
 IRC_NICK    = 'Furcifer'
 IRC_CHANNEL = '#opensuse-pizza-hackaton'
 
@@ -45,7 +50,78 @@ TABLE = {
     'SCR OTHER':  10,
 }
 
-HTML = '/tmp/table.html'
+HTML = '/suse/aplanas/Export/table.html'
+
+
+class BugBot(irc.bot.SingleServerIRCBot):
+    def __init__(self, channel, nickname, server, port=6667, dbname=None):
+        irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname,
+                                            nickname)
+        self.channel = channel
+        self.dbname = dbname
+
+    def on_nicknameinuse(self, c, e):
+        c.nick(c.get_nickname() + '_')
+
+    def on_welcome(self, c, e):
+        c.join(self.channel)
+
+    def on_privmsg(self, c, e):
+        self.do_command(e, e.arguments[0])
+
+    def on_pubmsg(self, c, e):
+        a = e.arguments[0].split(':', 1)
+        if len(a) > 1 and irc.strings.lower(a[0]) == irc.strings.lower(self.connection.get_nickname()):
+            self.do_command(e, a[1].strip())
+        return
+
+    def do_command(self, e, cmd):
+        nick = e.source.nick
+        c = self.connection
+
+        if cmd == 'help':
+            c.notice(nick, 'help -- list of commands')
+            c.notice(nick, 'ranking -- show the top 20 of the ranking')
+        elif cmd == 'ranking':
+            table = ranking(self.dbname)
+            hstr = '%20s %3s %3s %3s %3s %3s %3s %3s %3s %3s %3s %6s'
+            fstr = '%20s %3d %3d %3d %3d %3d %3d %3d %3d %3d %3d %6d'
+            c.notice(nick, hstr % ('User', 'FG', 'FS', 'FB', 'FO', 'SG', 'SS', 'SB', 'SO', 'Susp', 'Other', 'Points'))
+            for t in table[:20]:
+                c.notice(nick, fstr % tuple(t))
+        elif cmd == '_disconnect':
+            self.disconnect()
+        elif cmd == '_die':
+            self.die()
+        elif cmd == '_stats':
+            for chname, chobj in self.channels.items():
+                c.notice(nick, '--- Channel statistics ---')
+                c.notice(nick, 'Channel: ' + chname)
+                users = chobj.users()
+                users.sort()
+                c.notice(nick, 'Users: ' + ', '.join(users))
+                opers = chobj.opers()
+                opers.sort()
+                c.notice(nick, 'Opers: ' + ', '.join(opers))
+                voiced = chobj.voiced()
+                voiced.sort()
+                c.notice(nick, 'Voiced: ' + ', '.join(voiced))
+        else:
+            c.notice(nick, 'Not understood: ' + cmd)
+
+    def say(self, msg):
+        c = self.connection
+        c.privmsg(self.channel, msg)
+
+
+class BugBotThread(threading.Thread):
+    def __init__(self, bot):
+        threading.Thread.__init__(self)
+        self.bot = bot
+
+    def run(self):
+        self.bot.start()
+
 
 def initdb(dbname):
     """Initialize the database, removing old data."""
@@ -204,9 +280,9 @@ def get_bug_evaluation(bugid):
     bz.browser.add_password(BZ_HOST, BZ_USERNAME, BZ_PASSWORD)
     bug = bz.get_bugs(ids=(bugid,))[0]
 
-    evaluation = None
+    evaluation = 'OTHER'
     if hasattr(bug, 'status_whiteboard'):
-        for evaluation in ('GOLD', 'SILVER', 'BRONZE'):
+        for evaluation in ('GOLD', 'SILVER', 'BRONZE', 'OTHER'):
             if evaluation in bug.status_whiteboard:
                 break
 
@@ -250,7 +326,7 @@ def is_suspicious(bug):
             'Whiteboard' in bug['changed-fields'])
 
 
-def evaluate(dbname, bug):
+def evaluate(dbname, bug, bot):
     """Evaluate a bug action. Update the ranking table.
 
     Arguments:
@@ -271,7 +347,7 @@ def evaluate(dbname, bug):
     bugid = re.findall(r'\[Bug (\d+)\].*', bug['name'])[0]
     evaluation = get_bug_evaluation(bugid)
 
-    status = [evaluation if evaluation else 'Other']
+    status = [evaluation]
 
     if is_fix(bug):
         status.append('FIX')
@@ -283,6 +359,12 @@ def evaluate(dbname, bug):
             bronze_fix += 1
         else:
             other_fix += 1
+        if bot:
+            if evaluation in ('GOLD', 'SILVER', 'BRONZE'):
+                bot.say('%s has fixed a %s bug! (BNC#%s)'%(bug['who'], evaluation, bugid))
+            else:
+                bot.say('%s has fixed a bug! (BNC#%s)'%(bug['who'], bugid))
+
     elif (is_scr(bug) or is_new(bug)) and not is_auto(bug):
         status.append('SCR/NEW')
         if evaluation == 'GOLD':
@@ -293,6 +375,14 @@ def evaluate(dbname, bug):
             bronze_scr += 1
         else:
             other_scr += 1
+        if bot:
+            if evaluation in ('GOLD', 'SILVER', 'BRONZE'):
+                bot.say('%s has added more information in a %s bug! (BNC#%s)'%(bug['who'], evaluation, bugid))
+            elif is_new(bug):
+                bot.say('%s has created a new bug! (BNC#%s)'%(bug['who'], bugid))
+            else:
+                bot.say('%s has added more information in BNC#%s!'%(bug['who'], bugid))
+
     elif is_suspicious(bug) or is_reopen(bug):
         status.append('SUSPICIOUS/REOPEN')
         suspicious += 1
@@ -353,7 +443,7 @@ def evaluate(dbname, bug):
     conn.close()
 
 
-def process(dbname, msgids):
+def process(dbname, msgids, bot=None):
     messages = srv.fetch(msgids, ('FLAGS', 'INTERNALDATE', 'ENVELOPE',
                                   'BODY[HEADER]', 'BODY[TEXT]'))
     print 'Processing %d unread messages...' % len(messages)
@@ -365,9 +455,8 @@ def process(dbname, msgids):
             continue
 
         store(dbname, bug)
-        # if START <= bug['date'] < STOP:
-        #     evaluate(dbname, bug)
-        evaluate(dbname, bug)
+        if START <= bug['date'] < STOP:
+            evaluate(dbname, bug, bot)
 
 
 def ranking(dbname, html=False):
@@ -463,13 +552,18 @@ if __name__ == '__main__':
     srv = login(args.imap_host, args.imap_user, args.imap_password, ssl)
     srv.select_folder('INBOX')
 
+    # Start IRC bot
+    bot = BugBot(IRC_CHANNEL, IRC_NICK, IRC_HOST, dbname=dbname)
+    thread = BugBotThread(bot)
+    thread.start()
+
     # Process all the unread messages
     criteria = (
         'NOT DELETED', 
         'UNSEEN',
         'FROM bugzilla_noreply@novell.com',
     )
-    process(dbname, srv.search(criteria))
+    process(dbname, srv.search(criteria), bot=bot)
     with open(HTML, 'w') as f:
         print >>f, ranking(dbname, html=True)
 
@@ -478,7 +572,7 @@ if __name__ == '__main__':
         srv.idle()
         response = srv.idle_check()
         srv.idle_done()
-        process(dbname, [r[0] for r in response if r[1] == 'EXISTS'])
+        process(dbname, [r[0] for r in response if r[1] == 'EXISTS'], bot=bot)
         with open(HTML, 'w') as f:
             print >>f, ranking(dbname, html=True)
 
