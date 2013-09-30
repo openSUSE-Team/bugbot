@@ -2,6 +2,7 @@ import argparse
 from datetime import datetime
 import re
 import threading
+import time
 import sqlite3
 
 from imapclient import IMAPClient
@@ -89,6 +90,7 @@ class BugBot(irc.bot.SingleServerIRCBot):
             c.notice(nick, hstr % ('User', 'FG', 'FS', 'FB', 'FO', 'SG', 'SS', 'SB', 'SO', 'Susp', 'Other', 'Points'))
             for t in table[:20]:
                 c.notice(nick, fstr % tuple(t))
+                time.sleep(1)
         elif cmd == '_disconnect':
             self.disconnect()
         elif cmd == '_die':
@@ -557,23 +559,26 @@ if __name__ == '__main__':
     thread = BugBotThread(bot)
     thread.start()
 
-    # Process all the unread messages
-    criteria = (
-        'NOT DELETED', 
-        'UNSEEN',
-        'FROM bugzilla_noreply@novell.com',
-    )
-    process(dbname, srv.search(criteria), bot=bot)
-    with open(HTML, 'w') as f:
-        print >>f, ranking(dbname, html=True)
-
     print 'Processing new messages to arrive...'
     while True:
-        srv.idle()
-        response = srv.idle_check()
-        srv.idle_done()
-        process(dbname, [r[0] for r in response if r[1] == 'EXISTS'], bot=bot)
+        # Process all the unread messages
+        criteria = (
+            'NOT DELETED', 
+            'UNSEEN',
+            'FROM bugzilla_noreply@novell.com',
+        )
+        process(dbname, srv.search(criteria), bot=bot)
         with open(HTML, 'w') as f:
             print >>f, ranking(dbname, html=True)
+
+        # Go to IDLE mode
+        srv.idle()
+        response = srv.idle_check(timeout=300)
+        srv.idle_done()
+
+        # if response:
+        #     process(dbname, [r[0] for r in response if r[1] == 'EXISTS'], bot=bot)
+        #     with open(HTML, 'w') as f:
+        #         print >>f, ranking(dbname, html=True)
 
     srv.idle_done()
